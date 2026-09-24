@@ -1,0 +1,190 @@
+name: Release Android and iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已推送的版本标签，例如 v0.2.56+62'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Check tag and version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$ ]]; then
+            echo '标签格式必须是 v主版本.次版本.修订号+构建号' >&2
+            exit 1
+          fi
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          version="$(sed -n 's/^version: *//p' pubspec.yaml)"
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "标签 $RELEASE_TAG 与 pubspec.yaml 版本 $version 不一致" >&2
+            exit 1
+          fi
+          echo "commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - name: Require Android signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "缺少 $name Secret" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - run: sdkmanager 'ndk;28.2.13676358'
+      - name: Configure Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: python scripts/configure_signing.py
+      - name: Build signed Android packages
+        run: python scripts/build_android.py --all-sources
+      - name: Verify Android outputs
+        run: |
+          set -euo pipefail
+          test "$(find dist/android -maxdepth 1 -name '*.apk' | wc -l)" -eq 3
+          (cd dist/android && sha256sum --check SHA256SUMS.txt)
+      - name: Remove Android signing files
+        if: always()
+        run: python scripts/configure_signing.py --clean
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/android/*
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - name: Build unsigned iOS IPA
+        run: python3 scripts/build_ios.py --all-sources
+      - name: Verify iOS output
+        run: |
+          set -euo pipefail
+          test "$(find dist/ios -maxdepth 1 -name '*-ios-unsigned.ipa' | wc -l)" -eq 1
+          unzip -Z -1 dist/ios/*-ios-unsigned.ipa | grep -q '^Payload/Runner.app/Info.plist$'
+          (cd dist/ios && shasum -a 256 --check SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-ios-unsigned
+          path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [prepare, android, ios]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-android
+          path: android-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-ios-unsigned
+          path: ios-assets
+      - name: Prepare Release assets
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          cp android-assets/*.apk ios-assets/*-ios-unsigned.ipa release-assets/
+          (cd release-assets && sha256sum *.apk *.ipa > SHA256SUMS.txt)
+          test "$(find release-assets -maxdepth 1 -name '*.apk' | wc -l)" -eq 3
+          test "$(find release-assets -maxdepth 1 -name '*-ios-unsigned.ipa' | wc -l)" -eq 1
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/release-state" 2>/dev/null; then
+            if [[ "$(cat "$RUNNER_TEMP/release-state")" != 'true' ]]; then
+              echo "Release $RELEASE_TAG 已发布，不覆盖现有产物。" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --draft --title "秋秋短剧 $RELEASE_TAG"
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
