@@ -88,7 +88,6 @@ jobs:
           flutter-version: '3.47.4'
           channel: stable
           cache: true
-      - run: sdkmanager 'ndk;28.2.13676358'
       - name: Configure Android signing
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
