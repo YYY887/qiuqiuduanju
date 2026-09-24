@@ -1507,7 +1507,7 @@ class _HomeScreenState extends State<HomeScreen>
                 Positioned(
                   left: 0,
                   right: 0,
-                  bottom: MediaQuery.paddingOf(context).bottom + 8,
+                  bottom: MediaQuery.paddingOf(context).bottom,
                   child: AppBottomNavigation(
                     selectedIndex: _tab <= 2 ? _tab : 2,
                     onDestinationSelected: _changeTab,

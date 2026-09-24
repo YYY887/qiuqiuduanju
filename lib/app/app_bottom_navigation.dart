@@ -34,7 +34,7 @@ class AppBottomNavigation extends StatelessWidget {
       selectedIndex: selectedIndex,
       onTabSelected: onDestinationSelected,
       horizontalPadding: 18,
-      verticalPadding: 12,
+      verticalPadding: 4,
       barHeight: 66,
       indicatorColor: dark ? const Color(0xCC695251) : const Color(0xD9F5C5B6),
       selectedIconColor: accent,
